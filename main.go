@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/chromedp/chromedp"
 	"log"
@@ -20,7 +21,9 @@ type Job struct {
 
 func main() {
 	outputDir := "./ibm_jobs/"
-	os.MkdirAll(outputDir, os.ModePerm)
+	if err := os.MkdirAll(outputDir, os.ModePerm); err != nil {
+		log.Fatalf("Failed to create output directory: %v", err)
+	}
 
 	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
@@ -40,31 +43,40 @@ func main() {
 	log.Println("HTML content retrieved by chromedp")
 
 	for _, jobHTML := range jobListings {
-		job := extractJobInfo(jobHTML)
+		job, err := extractJobInfo(jobHTML)
+		if err != nil {
+			log.Printf("Error extracting job info: %v", err)
+			continue
+		}
 		if job.Title != "" && job.Location != "" && job.URL != "" {
-			saveJobData(job, outputDir)
+			if err := saveJobData(job, outputDir); err != nil {
+				log.Printf("Error saving job data: %v", err)
+			}
 		}
 	}
 
 	log.Println("Scraping completed.")
 }
 
-func extractJobInfo(html string) Job {
+func extractJobInfo(html string) (Job, error) {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
-		log.Println("Error parsing HTML:", err)
+		return Job{}, fmt.Errorf("error parsing HTML: %w", err)
 	}
 
 	title := doc.Find(".bx--card__heading").Text()
 	locationLevel, err := doc.Find(".ibm--card__copy__inner").Html()
 	if err != nil {
-		log.Println("Error extracting HTML:", err)
+		return Job{}, fmt.Errorf("error extracting HTML: %w", err)
 	}
-	url, _ := doc.Find("a.bx--card-group__card").Attr("href")
+	url, exists := doc.Find("a.bx--card-group__card").Attr("href")
+	if !exists {
+		return Job{}, fmt.Errorf("error finding URL")
+	}
 
 	locationParts := strings.Split(locationLevel, "<br/>")
 	if len(locationParts) < 2 {
-		log.Println("Invalid location/level format")
+		return Job{}, fmt.Errorf("invalid location/level format")
 	}
 	level := strings.TrimSpace(locationParts[0])
 	location := strings.TrimSpace(locationParts[1])
@@ -77,23 +89,23 @@ func extractJobInfo(html string) Job {
 		URL:             url,
 	}
 	log.Println("see job", job)
-	return job
+	return job, nil
 }
 
-func saveJobData(job Job, outputDir string) {
+func saveJobData(job Job, outputDir string) error {
 	jobFile := strings.ReplaceAll(job.Title, " ", "_") + ".json"
 	jobFile = strings.ReplaceAll(jobFile, "/", "_")
 	jobFilePath := outputDir + jobFile
 	file, err := os.Create(jobFilePath)
 	if err != nil {
-		log.Printf("Could not create file: %v", err)
-		return
+		return fmt.Errorf("could not create file: %w", err)
 	}
 	defer file.Close()
 
 	encoder := json.NewEncoder(file)
 	err = encoder.Encode(job)
 	if err != nil {
-		log.Printf("Could not write to file: %v", err)
+		return fmt.Errorf("could not write to file: %w", err)
 	}
+	return nil
 }
