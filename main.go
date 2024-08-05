@@ -1,11 +1,14 @@
 package main
 
 import (
+	"cloud.google.com/go/bigquery"
+	"cloud.google.com/go/storage"
 	"context"
-	"encoding/json"
+	"encoding/csv"
 	"fmt"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/chromedp/chromedp"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -20,12 +23,28 @@ type Job struct {
 }
 
 func main() {
-	outputDir := "./ibm_jobs/"
-	if err := os.MkdirAll(outputDir, os.ModePerm); err != nil {
-		log.Fatalf("Failed to create output directory: %v", err)
+	// open the file
+	outputFile := "ibm_jobs.csv"
+	file, err := os.Create(outputFile)
+	if err != nil {
+		log.Fatalf("Failed to create output file: %v", err)
+	}
+	defer func(file *os.File) {
+		err := file.Close()
+		if err != nil {
+			log.Fatalf("Failed to close output file: %v", err)
+		}
+	}(file)
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	if err := writer.Write([]string{"Title", "Location", "Description", "ExperienceLevel", "URL"}); err != nil {
+		log.Fatalf("Failed to write CSV header: %v", err)
 	}
 
-	ctx, cancel := chromedp.NewContext(context.Background())
+	// scrap
+	scrapingCtx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 
 	startUrl := "https://www.ibm.com/careers/search?p=1"
@@ -37,7 +56,7 @@ func main() {
 		var jobListings []string
 		var nextPageDisabled bool
 
-		err := chromedp.Run(ctx, chromedp.Tasks{
+		err := chromedp.Run(scrapingCtx, chromedp.Tasks{
 			chromedp.Navigate(url),
 			chromedp.WaitVisible(".bx--card-group__cards__col"),
 			chromedp.Evaluate(`Array.from(document.querySelectorAll('.bx--card-group__cards__col')).map(e => e.outerHTML)`, &jobListings),
@@ -57,11 +76,10 @@ func main() {
 				continue
 			}
 			if job.Title != "" && job.Location != "" && job.URL != "" {
-				if err := saveJobData(job, outputDir); err != nil {
-					log.Printf("Error saving job data: %v", err)
-				} else {
-					totalItems++
+				if err := writer.Write([]string{job.Title, job.Location, job.Description, job.ExperienceLevel, job.URL}); err != nil {
+					log.Fatalf("Failed to write job to CSV: %v", err)
 				}
+				totalItems++
 			}
 		}
 
@@ -73,6 +91,26 @@ func main() {
 		url = fmt.Sprintf("https://www.ibm.com/careers/search?p=%d", pageNumber)
 	}
 	log.Println("Scraping completed. Total jobs extracted: ", totalItems)
+
+	// Upload CSV file to Google Cloud Storage
+	ctx := context.Background()
+	bucketName := "ibm_jobs_bucket"
+	if err := uploadFileToGCS(ctx, bucketName, outputFile, outputFile); err != nil {
+		log.Fatalf("Failed to upload file to GCS: %v", err)
+	}
+
+	// Load CSV file from GCS into BigQuery
+	projectID := "jobcrawler-391820"
+	datasetID := "ibm_jobs"
+	tableID := "ibm_jobs_main_table"
+	client, err := bigquery.NewClient(ctx, projectID)
+	if err != nil {
+		log.Fatalf("Failed to create BigQuery client: %v", err)
+	}
+
+	if err := loadCSVFromGCS(ctx, client, datasetID, tableID, bucketName, outputFile); err != nil {
+		log.Fatalf("Failed to load CSV into BigQuery: %v", err)
+	}
 }
 
 func extractJobInfo(html string) (Job, error) {
@@ -108,20 +146,55 @@ func extractJobInfo(html string) (Job, error) {
 	return job, nil
 }
 
-func saveJobData(job Job, outputDir string) error {
-	jobFile := strings.ReplaceAll(job.Title, " ", "_") + ".json"
-	jobFile = strings.ReplaceAll(jobFile, "/", "_")
-	jobFilePath := outputDir + jobFile
-	file, err := os.Create(jobFilePath)
+func uploadFileToGCS(ctx context.Context, bucketName, objectName, filePath string) error {
+	client, err := storage.NewClient(ctx)
 	if err != nil {
-		return fmt.Errorf("could not create file: %w", err)
+		return fmt.Errorf("failed to create storage client: %w", err)
 	}
-	defer file.Close()
+	defer client.Close()
 
-	encoder := json.NewEncoder(file)
-	err = encoder.Encode(job)
+	bucket := client.Bucket(bucketName)
+	object := bucket.Object(objectName)
+
+	f, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("could not write to file: %w", err)
+		return fmt.Errorf("failed to open file: %w", err)
 	}
+	defer f.Close()
+
+	w := object.NewWriter(ctx)
+	if _, err := io.Copy(w, f); err != nil {
+		return fmt.Errorf("failed to copy file to GCS: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("failed to close GCS writer: %w", err)
+	}
+
+	return nil
+}
+
+func loadCSVFromGCS(ctx context.Context, client *bigquery.Client, datasetID, tableID, bucketName, filePath string) error {
+	gcsRef := bigquery.NewGCSReference(fmt.Sprintf("gs://%s/%s", bucketName, filePath))
+	gcsRef.SourceFormat = bigquery.CSV
+	gcsRef.FieldDelimiter = ","
+	gcsRef.SkipLeadingRows = 1
+
+	loader := client.Dataset(datasetID).Table(tableID).LoaderFrom(gcsRef)
+	loader.WriteDisposition = bigquery.WriteAppend
+
+	job, err := loader.Run(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to start load job: %w", err)
+	}
+
+	status, err := job.Wait(ctx)
+	if err != nil {
+		return fmt.Errorf("job did not complete successfully: %w", err)
+	}
+
+	if err := status.Err(); err != nil {
+		return fmt.Errorf("job completed with error: %w", err)
+	}
+
 	return nil
 }
