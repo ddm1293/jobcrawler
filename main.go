@@ -28,34 +28,51 @@ func main() {
 	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 
-	url := "https://www.ibm.com/careers/search"
-	var jobListings []string
-	err := chromedp.Run(ctx, chromedp.Tasks{
-		chromedp.Navigate(url),
-		chromedp.WaitVisible(".bx--card-group__cards__col"),
-		chromedp.Evaluate(`Array.from(document.querySelectorAll('.bx--card-group__cards__col')).map(e => e.outerHTML)`, &jobListings),
-	})
-	log.Println("Starting scraping at ", url)
-	if err != nil {
-		log.Fatalf("Failed to complete chromedp tasks: %v", err)
-		return
-	}
-	log.Println("HTML content retrieved by chromedp")
+	startUrl := "https://www.ibm.com/careers/search?p=1"
+	totalItems := 0
+	pageNumber := 1
 
-	for _, jobHTML := range jobListings {
-		job, err := extractJobInfo(jobHTML)
+	url := startUrl
+	for {
+		var jobListings []string
+		var nextPageDisabled bool
+
+		err := chromedp.Run(ctx, chromedp.Tasks{
+			chromedp.Navigate(url),
+			chromedp.WaitVisible(".bx--card-group__cards__col"),
+			chromedp.Evaluate(`Array.from(document.querySelectorAll('.bx--card-group__cards__col')).map(e => e.outerHTML)`, &jobListings),
+			chromedp.Evaluate(`document.querySelector('a[data-key="next"][aria-disabled="true"]') !== null`, &nextPageDisabled),
+		})
+
+		log.Printf("Starting scraping at page: %d, URL: %s, count: %d", pageNumber, url, totalItems)
 		if err != nil {
-			log.Printf("Error extracting job info: %v", err)
-			continue
+			log.Fatalf("Failed to complete chromedp tasks: %v", err)
+			return
 		}
-		if job.Title != "" && job.Location != "" && job.URL != "" {
-			if err := saveJobData(job, outputDir); err != nil {
-				log.Printf("Error saving job data: %v", err)
+
+		for _, jobHTML := range jobListings {
+			job, err := extractJobInfo(jobHTML)
+			if err != nil {
+				log.Printf("Error extracting job info: %v", err)
+				continue
+			}
+			if job.Title != "" && job.Location != "" && job.URL != "" {
+				if err := saveJobData(job, outputDir); err != nil {
+					log.Printf("Error saving job data: %v", err)
+				} else {
+					totalItems++
+				}
 			}
 		}
-	}
 
-	log.Println("Scraping completed.")
+		if nextPageDisabled {
+			break
+		}
+
+		pageNumber++
+		url = fmt.Sprintf("https://www.ibm.com/careers/search?p=%d", pageNumber)
+	}
+	log.Println("Scraping completed. Total jobs extracted: ", totalItems)
 }
 
 func extractJobInfo(html string) (Job, error) {
@@ -88,7 +105,6 @@ func extractJobInfo(html string) (Job, error) {
 		ExperienceLevel: level,
 		URL:             url,
 	}
-	log.Println("see job", job)
 	return job, nil
 }
 
